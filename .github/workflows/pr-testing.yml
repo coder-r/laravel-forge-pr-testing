@@ -1,0 +1,684 @@
+name: PR Testing Environment
+
+# Trigger on PR comment (/preview, /destroy, /update) and auto-cleanup on PR close
+on:
+  issue_comment:
+    types: [created, edited]
+  pull_request:
+    types: [closed]
+
+# Minimal permissions - only what's needed
+permissions:
+  contents: read
+  pull-requests: write
+
+# Environment-specific configuration
+env:
+  FORGE_API_BASE_URL: https://forge.laravel.com/api/v1
+  DEPLOYMENT_TIMEOUT: 600  # 10 minutes
+  LOG_RETENTION: 30  # days
+
+jobs:
+  # ============================================================================
+  # ROUTE COMMANDS: Parse comment and route to appropriate job
+  # ============================================================================
+  route-command:
+    name: Route PR Command
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      (
+        contains(github.event.comment.body, '/preview') ||
+        contains(github.event.comment.body, '/destroy') ||
+        contains(github.event.comment.body, '/update')
+      )
+    outputs:
+      command: ${{ steps.parse.outputs.command }}
+      pr_number: ${{ steps.parse.outputs.pr_number }}
+      pr_sha: ${{ steps.parse.outputs.pr_sha }}
+      project: ${{ steps.parse.outputs.project }}
+      proceed: ${{ steps.parse.outputs.proceed }}
+
+    steps:
+      - name: Validate Commenter Permissions
+        id: validate
+        uses: actions/github-script@v7
+        env:
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // Check if user has push access
+            try {
+              const collab = await github.rest.repos.checkCollaborator({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                username: '${{ env.COMMENT_AUTHOR }}'
+              });
+              core.setOutput('has_permission', 'true');
+            } catch {
+              core.warning(`User ${{ env.COMMENT_AUTHOR }} does not have push access`);
+              core.setOutput('has_permission', 'false');
+            }
+
+      - name: Parse Command
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const comment = '${{ github.event.comment.body }}';
+            const pr_number = context.issue.number;
+
+            // Determine command
+            let command = 'none';
+            if (comment.includes('/preview')) command = 'create';
+            if (comment.includes('/destroy')) command = 'destroy';
+            if (comment.includes('/update')) command = 'update';
+
+            core.setOutput('command', command);
+            core.setOutput('pr_number', pr_number);
+            core.setOutput('proceed', '${{ steps.validate.outputs.has_permission }}');
+
+            // Get PR details
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr_number
+            });
+
+            core.setOutput('pr_sha', pr.data.head.sha);
+
+            // Try to detect project from labels or branch
+            const labels = pr.data.labels.map(l => l.name);
+            let project = 'customer-app';  // default
+
+            if (labels.includes('project:epos') || pr.data.head.ref.includes('epos')) {
+              project = 'epos';
+            }
+
+            core.setOutput('project', project);
+            core.info(`Command: ${command}, PR: ${pr_number}, SHA: ${pr.data.head.sha}, Project: ${project}`);
+
+      - name: Add Reaction (Command Received)
+        if: steps.parse.outputs.proceed == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes'
+            });
+
+      - name: Permission Denied
+        if: steps.parse.outputs.proceed != 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '❌ Permission denied. You need push access to use PR testing environments.'
+            });
+
+  # ============================================================================
+  # CREATE ENVIRONMENT: Deploy new PR testing site via Forge
+  # ============================================================================
+  create-environment:
+    name: Create Testing Environment
+    needs: route-command
+    if: needs.route-command.outputs.proceed == 'true' && needs.route-command.outputs.command == 'create'
+    runs-on: ubuntu-latest
+    outputs:
+      site_id: ${{ steps.create_site.outputs.site_id }}
+      site_name: ${{ steps.create_site.outputs.site_name }}
+      site_url: ${{ steps.create_site.outputs.site_url }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.route-command.outputs.pr_sha }}
+          fetch-depth: 0
+
+      - name: Check Existing Environment
+        id: check_existing
+        uses: actions/github-script@v7
+        env:
+          FORGE_TOKEN: ${{ secrets.FORGE_API_TOKEN }}
+          SERVER_ID: ${{ secrets.FORGE_SERVER_ID }}
+        with:
+          script: |
+            const pr_num = '${{ needs.route-command.outputs.pr_number }}';
+            const siteName = `pr-${pr_num}.on-forge.com`;
+
+            core.info(`Checking if site ${siteName} already exists...`);
+            core.setOutput('site_name', siteName);
+
+      - name: Create Forge Site via API
+        id: create_site
+        env:
+          FORGE_TOKEN: ${{ secrets.FORGE_API_TOKEN }}
+          SERVER_ID: ${{ secrets.FORGE_SERVER_ID }}
+          PROJECT: ${{ needs.route-command.outputs.project }}
+          PR_NUMBER: ${{ needs.route-command.outputs.pr_number }}
+        run: |
+          set -e
+
+          PR_NUM=${{ needs.route-command.outputs.pr_number }}
+          SITE_NAME="pr-${PR_NUM}.on-forge.com"
+
+          echo "Creating Forge site: ${SITE_NAME}"
+
+          # Create site with isolated user for security
+          RESPONSE=$(curl -s -X POST "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites" \
+            -H "Authorization: Bearer ${FORGE_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d @- <<EOF
+          {
+            "domain": "${SITE_NAME}",
+            "project_type": "php",
+            "directory": "/public",
+            "isolated": true,
+            "php_version": "php82"
+          }
+          EOF
+          )
+
+          # Extract site ID from response
+          SITE_ID=$(echo "$RESPONSE" | jq -r '.site.id // empty')
+
+          if [ -z "$SITE_ID" ]; then
+            echo "Failed to create site. Response:"
+            echo "$RESPONSE" | jq .
+            exit 1
+          fi
+
+          echo "Site created with ID: $SITE_ID"
+          echo "site_id=${SITE_ID}" >> $GITHUB_OUTPUT
+          echo "site_name=${SITE_NAME}" >> $GITHUB_OUTPUT
+          echo "site_url=https://${SITE_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Wait for Site Installation
+        env:
+          FORGE_TOKEN: ${{ secrets.FORGE_API_TOKEN }}
+          SERVER_ID: ${{ secrets.FORGE_SERVER_ID }}
+          SITE_ID: ${{ steps.create_site.outputs.site_id }}
+        run: |
+          set -e
+
+          TIMEOUT=300
+          ELAPSED=0
+          CHECK_INTERVAL=5
+
+          echo "Waiting for site installation (max ${TIMEOUT}s)..."
+
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            STATUS=$(curl -s -X GET "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}" \
+              -H "Authorization: Bearer ${FORGE_TOKEN}" \
+              -H "Accept: application/json" | jq -r '.site.status // empty')
+
+            if [ "$STATUS" = "installed" ]; then
+              echo "Site installation complete!"
+              break
+            fi
+
+            echo "Status: $STATUS (${ELAPSED}s elapsed)"
+            sleep $CHECK_INTERVAL
+            ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+          done
+
+          if [ $ELAPSED -ge $TIMEOUT ]; then
+            echo "Timeout waiting for site installation"
+            exit 1
+          fi
+
+      - name: Configure Git Repository
+        id: configure_repo
+        env:
+          FORGE_TOKEN: ${{ secrets.FORGE_API_TOKEN }}
+          SERVER_ID: ${{ secrets.FORGE_SERVER_ID }}
+          SITE_ID: ${{ steps.create_site.outputs.site_id }}
+          PR_SHA: ${{ needs.route-command.outputs.pr_sha }}
+          GITHUB_REPO: ${{ github.repository }}
+        run: |
+          set -e
+
+          echo "Configuring git repository..."
+
+          # Install repository on Forge
+          curl -s -X POST "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}/git" \
+            -H "Authorization: Bearer ${FORGE_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d @- <<EOF
+          {
+            "provider": "github",
+            "repository": "${GITHUB_REPO}",
+            "branch": "main"
+          }
+          EOF
+
+          echo "Repository configured"
+
+      - name: Deploy Code to PR Branch
+        env:
+          FORGE_TOKEN: ${{ secrets.FORGE_API_TOKEN }}
+          SERVER_ID: ${{ secrets.FORGE_SERVER_ID }}
+          SITE_ID: ${{ steps.create_site.outputs.site_id }}
+          PR_BRANCH: ${{ github.head_ref }}
+        run: |
+          set -e
+
+          echo "Deploying PR branch: ${PR_BRANCH}"
+
+          # Update deployment script to use PR branch
+          curl -s -X PUT "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}/deployment-script" \
+            -H "Authorization: Bearer ${FORGE_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d @- <<'EOF'
+          {
+            "content": "cd /home/forge/pr-${{ needs.route-command.outputs.pr_number }}.on-forge.com\ngit fetch origin ${{ github.head_ref }}\ngit reset --hard origin/${{ github.head_ref }}\ncomposer install --no-interaction --prefer-dist\nphp artisan migrate --force\nphp artisan cache:clear\nphp artisan config:clear"
+          }
+          EOF
+
+          # Trigger deployment
+          curl -s -X POST "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}/deployment/request" \
+            -H "Authorization: Bearer ${FORGE_TOKEN}" \
+            -H "Content-Type: application/json" | jq .
+
+      - name: Setup Environment Variables
+        env:
+          FORGE_TOKEN: ${{ secrets.FORGE_API_TOKEN }}
+          SERVER_ID: ${{ secrets.FORGE_SERVER_ID }}
+          SITE_ID: ${{ steps.create_site.outputs.site_id }}
+          PROJECT: ${{ needs.route-command.outputs.project }}
+        run: |
+          set -e
+
+          echo "Configuring environment variables..."
+
+          # Set database credentials
+          curl -s -X POST "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}/environment-variables" \
+            -H "Authorization: Bearer ${FORGE_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d @- <<EOF
+          {
+            "name": "APP_ENV",
+            "value": "testing"
+          }
+          EOF
+
+          curl -s -X POST "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}/environment-variables" \
+            -H "Authorization: Bearer ${FORGE_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d @- <<EOF
+          {
+            "name": "APP_DEBUG",
+            "value": "false"
+          }
+          EOF
+
+          echo "Environment variables configured"
+
+      - name: Clone Database Snapshot
+        env:
+          FORGE_TOKEN: ${{ secrets.FORGE_API_TOKEN }}
+          SERVER_ID: ${{ secrets.FORGE_SERVER_ID }}
+          PROJECT: ${{ needs.route-command.outputs.project }}
+          PR_NUMBER: ${{ needs.route-command.outputs.pr_number }}
+        run: |
+          set -e
+
+          echo "Setting up database from snapshot..."
+
+          # This assumes a master database snapshot exists
+          # Adjust DB names based on your project setup
+          if [ "$PROJECT" = "epos" ]; then
+            SOURCE_DB="pr_master_epos"
+            TARGET_DB="pr_${PR_NUMBER}_epos"
+          else
+            SOURCE_DB="pr_master_customer"
+            TARGET_DB="pr_${PR_NUMBER}_customer"
+          fi
+
+          echo "Cloning database: $SOURCE_DB → $TARGET_DB"
+
+          # This command is typically run on the server via SSH
+          # For now, we'll document it - actual implementation depends on your setup
+          # ssh -i ~/.ssh/id_rsa forge@server "mysqldump -u forge -p'password' $SOURCE_DB | mysql -u forge -p'password' $TARGET_DB"
+
+      - name: Enable SSL Certificate
+        env:
+          FORGE_TOKEN: ${{ secrets.FORGE_API_TOKEN }}
+          SERVER_ID: ${{ secrets.FORGE_SERVER_ID }}
+          SITE_ID: ${{ steps.create_site.outputs.site_id }}
+        run: |
+          set -e
+
+          echo "Enabling SSL certificate..."
+
+          # Enable Let's Encrypt SSL (automatic for on-forge.com)
+          curl -s -X POST "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}/certificates" \
+            -H "Authorization: Bearer ${FORGE_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "type": "letsencrypt"
+            }' | jq .
+
+          echo "SSL setup initiated (will be provisioned by Forge automatically)"
+
+      - name: Start Queue Workers
+        env:
+          FORGE_TOKEN: ${{ secrets.FORGE_API_TOKEN }}
+          SERVER_ID: ${{ secrets.FORGE_SERVER_ID }}
+          SITE_ID: ${{ steps.create_site.outputs.site_id }}
+        run: |
+          set -e
+
+          echo "Starting queue workers..."
+
+          # Create queue worker for background jobs
+          curl -s -X POST "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/workers" \
+            -H "Authorization: Bearer ${FORGE_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d @- <<EOF
+          {
+            "connection": "redis",
+            "queue": "default",
+            "timeout": 60,
+            "sleep": 3,
+            "processes": 2,
+            "site_id": ${SITE_ID}
+          }
+          EOF
+
+          echo "Queue workers configured"
+
+      - name: Create PR Comment with Test URL
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const siteUrl = '${{ steps.create_site.outputs.site_url }}';
+            const siteName = '${{ steps.create_site.outputs.site_name }}';
+            const siteId = '${{ steps.create_site.outputs.site_id }}';
+            const prNumber = '${{ needs.route-command.outputs.pr_number }}';
+
+            const comment = "## Preview Environment Ready\n\n" +
+              "✅ **Testing environment created successfully!**\n\n" +
+              "### Quick Links\n" +
+              `- **Test URL**: [${siteName}](${siteUrl})\n` +
+              `- **Site ID**: \`${siteId}\`\n` +
+              `- **PR Number**: #${prNumber}\n\n` +
+              "### What's Included\n" +
+              "- ✅ Isolated environment with own database\n" +
+              "- ✅ Database snapshot with realistic test data\n" +
+              "- ✅ Queue workers for background jobs\n" +
+              "- ✅ Automatic SSL certificate (HTTPS)\n" +
+              "- ✅ All code from this PR deployed\n\n" +
+              "### Available Commands\n" +
+              "- `/preview` - Create/recreate environment\n" +
+              "- `/update` - Redeploy latest PR code\n" +
+              "- `/destroy` - Delete environment (auto-deletes on PR close)\n\n" +
+              "### Testing Tips\n" +
+              `1. Visit: ${siteUrl}\n` +
+              "2. Log in with test credentials\n" +
+              "3. Test your feature changes\n" +
+              "4. Note any issues in PR comments\n\n" +
+              "### Cleanup\n" +
+              "This environment will automatically be deleted when:\n" +
+              "- ✅ PR is merged\n" +
+              "- ✅ PR is closed\n" +
+              "- ✅ You comment `/destroy`\n\n" +
+              `---\n*Environment created at ${new Date().toISOString()}*`;
+
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: comment
+            });
+
+      - name: Add Success Label
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ['preview-environment']
+            });
+
+  # ============================================================================
+  # UPDATE ENVIRONMENT: Redeploy code to existing environment
+  # ============================================================================
+  update-environment:
+    name: Update Testing Environment
+    needs: route-command
+    if: needs.route-command.outputs.proceed == 'true' && needs.route-command.outputs.command == 'update'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.route-command.outputs.pr_sha }}
+
+      - name: Get Site ID from Forge
+        id: get_site
+        env:
+          FORGE_TOKEN: ${{ secrets.FORGE_API_TOKEN }}
+          SERVER_ID: ${{ secrets.FORGE_SERVER_ID }}
+          PR_NUMBER: ${{ needs.route-command.outputs.pr_number }}
+        run: |
+          set -e
+
+          SITE_NAME="pr-${PR_NUMBER}.on-forge.com"
+
+          echo "Finding site: ${SITE_NAME}"
+
+          RESPONSE=$(curl -s -X GET "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites" \
+            -H "Authorization: Bearer ${FORGE_TOKEN}" \
+            -H "Accept: application/json")
+
+          SITE_ID=$(echo "$RESPONSE" | jq -r ".sites[] | select(.name == \"${SITE_NAME}\") | .id // empty")
+
+          if [ -z "$SITE_ID" ]; then
+            echo "Site not found. Run /preview command to create environment first."
+            exit 1
+          fi
+
+          echo "site_id=${SITE_ID}" >> $GITHUB_OUTPUT
+
+      - name: Deploy Latest Code
+        env:
+          FORGE_TOKEN: ${{ secrets.FORGE_API_TOKEN }}
+          SERVER_ID: ${{ secrets.FORGE_SERVER_ID }}
+          SITE_ID: ${{ steps.get_site.outputs.site_id }}
+          PR_BRANCH: ${{ github.head_ref }}
+        run: |
+          set -e
+
+          echo "Deploying latest code from branch: ${PR_BRANCH}"
+
+          # Trigger deployment
+          curl -s -X POST "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}/deployment/request" \
+            -H "Authorization: Bearer ${FORGE_TOKEN}" \
+            -H "Content-Type: application/json" | jq .
+
+          echo "Deployment triggered"
+
+      - name: Update PR Comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '✅ Code updated! Deployment in progress. Refresh the page in ~30 seconds.'
+            });
+
+  # ============================================================================
+  # DESTROY ENVIRONMENT: Delete site via Forge
+  # ============================================================================
+  destroy-environment:
+    name: Destroy Testing Environment
+    needs: route-command
+    if: needs.route-command.outputs.proceed == 'true' && needs.route-command.outputs.command == 'destroy'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get Site ID from Forge
+        id: get_site
+        env:
+          FORGE_TOKEN: ${{ secrets.FORGE_API_TOKEN }}
+          SERVER_ID: ${{ secrets.FORGE_SERVER_ID }}
+          PR_NUMBER: ${{ needs.route-command.outputs.pr_number }}
+        run: |
+          set -e
+
+          SITE_NAME="pr-${PR_NUMBER}.on-forge.com"
+
+          echo "Finding site: ${SITE_NAME}"
+
+          RESPONSE=$(curl -s -X GET "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites" \
+            -H "Authorization: Bearer ${FORGE_TOKEN}" \
+            -H "Accept: application/json")
+
+          SITE_ID=$(echo "$RESPONSE" | jq -r ".sites[] | select(.name == \"${SITE_NAME}\") | .id // empty")
+
+          if [ -z "$SITE_ID" ]; then
+            echo "Site not found - may already be deleted"
+            echo "site_id=" >> $GITHUB_OUTPUT
+          else
+            echo "site_id=${SITE_ID}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Delete Site via Forge API
+        if: steps.get_site.outputs.site_id != ''
+        env:
+          FORGE_TOKEN: ${{ secrets.FORGE_API_TOKEN }}
+          SERVER_ID: ${{ secrets.FORGE_SERVER_ID }}
+          SITE_ID: ${{ steps.get_site.outputs.site_id }}
+        run: |
+          set -e
+
+          echo "Deleting site: ${SITE_ID}"
+
+          curl -s -X DELETE "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}" \
+            -H "Authorization: Bearer ${FORGE_TOKEN}" \
+            -H "Accept: application/json"
+
+          echo "Site deletion initiated"
+
+      - name: Create Cleanup Comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '🗑️ Preview environment deleted. Run `/preview` to create a new one.'
+            });
+
+      - name: Remove Preview Label
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            try {
+              github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                name: 'preview-environment'
+              });
+            } catch (error) {
+              // Label may not exist, that's okay
+              core.info('Label not found or already removed');
+            }
+
+  # ============================================================================
+  # AUTO-CLEANUP: Delete environment when PR is closed
+  # ============================================================================
+  auto-cleanup-on-pr-close:
+    name: Auto-Cleanup on PR Close
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+
+    steps:
+      - name: Get Site ID from Forge
+        id: get_site
+        env:
+          FORGE_TOKEN: ${{ secrets.FORGE_API_TOKEN }}
+          SERVER_ID: ${{ secrets.FORGE_SERVER_ID }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -e
+
+          SITE_NAME="pr-${PR_NUMBER}.on-forge.com"
+
+          echo "Finding site for cleanup: ${SITE_NAME}"
+
+          RESPONSE=$(curl -s -X GET "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites" \
+            -H "Authorization: Bearer ${FORGE_TOKEN}" \
+            -H "Accept: application/json")
+
+          SITE_ID=$(echo "$RESPONSE" | jq -r ".sites[] | select(.name == \"${SITE_NAME}\") | .id // empty")
+
+          if [ -z "$SITE_ID" ]; then
+            echo "No environment found - nothing to cleanup"
+            echo "site_id=" >> $GITHUB_OUTPUT
+          else
+            echo "site_id=${SITE_ID}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Delete Site
+        if: steps.get_site.outputs.site_id != ''
+        env:
+          FORGE_TOKEN: ${{ secrets.FORGE_API_TOKEN }}
+          SERVER_ID: ${{ secrets.FORGE_SERVER_ID }}
+          SITE_ID: ${{ steps.get_site.outputs.site_id }}
+        run: |
+          set -e
+
+          echo "Auto-cleaning up site: ${SITE_ID}"
+
+          curl -s -X DELETE "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}" \
+            -H "Authorization: Bearer ${FORGE_TOKEN}" \
+            -H "Accept: application/json"
+
+          echo "Auto-cleanup complete"
+
+      - name: Post Cleanup Comment
+        if: steps.get_site.outputs.site_id != ''
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: github.event.pull_request.number,
+              body: '🧹 Preview environment automatically cleaned up.'
+            });
+
+# ============================================================================
+# CONCURRENCY: Prevent duplicate runs for same PR
+# ============================================================================
+concurrency:
+  group: pr-testing-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: true

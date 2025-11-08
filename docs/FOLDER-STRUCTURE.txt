@@ -1,0 +1,155 @@
+Laravel PR Testing Environment - Documentation Structure
+═══════════════════════════════════════════════════════
+
+emphermal-llaravel-app/
+├── README.md                                          ← Project overview & quick links
+├── CLAUDE.md                                         ← Configuration (existing)
+│
+└── docs/                                              ← ALL DOCUMENTATION HERE
+    │
+    ├── 0-README-START-HERE.md                        ← Navigation guide (START HERE!)
+    ├── 1-QUICK-START.md                              ← 15-minute executive summary
+    │
+    ├── 2-background-reading/                         ← Context & analysis
+    │   ├── 1-requirements-analysis.md                   • Detailed requirements
+    │   ├── 2-forge-capabilities.md                      • Laravel Forge features
+    │   └── 3-infrastructure-overview.md                 • Current infrastructure
+    │
+    ├── 3-critical-reading/                           ← Must-read before coding!
+    │   ├── 1-architecture-design.md                     • Complete system architecture
+    │   ├── 2-security-considerations.md                 • Security, access controls
+    │   └── 3-database-strategy.md                       • Database replication
+    │
+    ├── 4-implementation/                             ← Step-by-step guides
+    │   ├── 1-forge-setup-checklist.md                   • Days 1-3: Forge setup
+    │   ├── 2-github-integration.md                      • Days 4-7: GitHub Actions
+    │   ├── 3-automation-scripts.md                      • Core automation scripts
+    │   └── 4-deployment-workflow.md                     • End-to-end workflow
+    │
+    ├── 5-reference/                                  ← Lookup materials
+    │   ├── 1-forge-api-reference.md                     • Quick API reference
+    │   ├── 2-troubleshooting.md                         • Common issues & solutions
+    │   └── 3-cost-breakdown.md                          • Detailed cost analysis
+    │
+    └── FOLDER-STRUCTURE.txt                          ← This file
+
+
+📁 Documentation Organization
+═══════════════════════════════
+
+LEVEL 0 - START HERE
+┌─────────────────────────────────────────────────────────────┐
+│ 0-README-START-HERE.md   → How to use this documentation    │
+│ 1-QUICK-START.md         → 15-minute overview               │
+└─────────────────────────────────────────────────────────────┘
+
+LEVEL 1 - BACKGROUND (1-2 hours reading)
+┌─────────────────────────────────────────────────────────────┐
+│ 2-background-reading/                                       │
+│   ├── Requirements analysis                                 │
+│   ├── Forge capabilities                                    │
+│   └── Infrastructure overview                               │
+└─────────────────────────────────────────────────────────────┘
+
+LEVEL 2 - CRITICAL (2-3 hours reading) ⚠️ READ BEFORE CODING!
+┌─────────────────────────────────────────────────────────────┐
+│ 3-critical-reading/                                         │
+│   ├── Architecture design (complete system)                 │
+│   ├── Security considerations (access control)              │
+│   └── Database strategy (replication, snapshots)            │
+└─────────────────────────────────────────────────────────────┘
+
+LEVEL 3 - IMPLEMENTATION (2-5 days work)
+┌─────────────────────────────────────────────────────────────┐
+│ 4-implementation/                                           │
+│   ├── Forge setup checklist (Days 1-3)                     │
+│   ├── GitHub integration (Days 4-7)                        │
+│   ├── Automation scripts (Core code)                       │
+│   └── Deployment workflow (End-to-end guide)               │
+└─────────────────────────────────────────────────────────────┘
+
+LEVEL 4 - REFERENCE (as needed)
+┌─────────────────────────────────────────────────────────────┐
+│ 5-reference/                                                │
+│   ├── Forge API reference (Quick lookup)                   │
+│   ├── Troubleshooting (Problem solving)                    │
+│   └── Cost breakdown (Budget analysis)                     │
+└─────────────────────────────────────────────────────────────┘
+
+
+📊 Document Statistics
+═══════════════════════
+
+Total Documents: 15 markdown files
+├── Navigation: 2 files
+├── Background: 3 files
+├── Critical: 3 files
+├── Implementation: 4 files
+└── Reference: 3 files
+
+Estimated Reading Time: 6-8 hours total
+Estimated Implementation Time: 1-2 weeks
+Total Project Timeline: 10-14 days to production
+
+
+🎯 Quick Access Guide
+═══════════════════════
+
+NEW TO PROJECT?
+   Start: docs/0-README-START-HERE.md
+   Then: docs/1-QUICK-START.md
+
+NEED OVERVIEW?
+   Read: docs/1-QUICK-START.md (15 minutes)
+
+READY TO IMPLEMENT?
+   Read: docs/3-critical-reading/ (all 3 files first!)
+   Then: docs/4-implementation/ (follow in order)
+
+NEED HELP?
+   Check: docs/5-reference/2-troubleshooting.md
+
+NEED COSTS?
+   Check: docs/5-reference/3-cost-breakdown.md
+
+NEED API INFO?
+   Check: docs/5-reference/1-forge-api-reference.md
+
+
+🔴 CRITICAL PATH
+═══════════════════════
+
+For fastest implementation (1-2 weeks):
+
+Day 1: Read 0-README-START-HERE.md + 1-QUICK-START.md (1 hour)
+Day 2: Read all 3-critical-reading/ files (3 hours)
+Day 3: Follow 4-implementation/1-forge-setup-checklist.md
+Day 4-5: Follow 4-implementation/2-github-integration.md
+Day 6-7: Follow 4-implementation/3-automation-scripts.md
+Day 8-10: Test with 4-implementation/4-deployment-workflow.md
+Day 11-14: Refine, document, train team
+
+
+💡 Pro Tips
+═══════════════════════
+
+1. Don't skip 3-critical-reading/ - it saves days of debugging
+2. Follow implementation guides in order (they build on each other)
+3. Keep 5-reference/2-troubleshooting.md open while implementing
+4. Both projects (keatchen-customer-app, devpel-epos) use same pattern
+5. Database snapshots from weekend evenings = most realistic testing
+
+
+📞 Support Resources
+═══════════════════════
+
+Laravel Forge Docs: https://forge.laravel.com/docs
+Forge API Docs: https://forge.laravel.com/api-documentation
+GitHub Actions Docs: https://docs.github.com/en/actions
+Troubleshooting Guide: docs/5-reference/2-troubleshooting.md
+
+
+═══════════════════════════════════════════════════════
+Last Updated: 2025-11-07
+Version: 1.0
+═══════════════════════════════════════════════════════

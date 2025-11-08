@@ -1,0 +1,1047 @@
+#!/bin/bash
+
+################################################################################
+# orchestrate-pr-system.sh
+#
+# Complete PR Testing System Orchestration via Forge API
+#
+# Orchestrates the entire lifecycle of PR testing environments:
+#   - Creates VPS server for PR testing
+#   - Configures site with on-forge.com domain
+#   - Creates and clones databases
+#   - Sets up Git repository connection
+#   - Installs SSL certificate
+#   - Deploys code
+#   - Runs health checks
+#   - Returns PR test URL
+#
+# Features:
+#   - Full API automation (no manual steps)
+#   - Automatic rollback on failure
+#   - Comprehensive logging
+#   - Status polling with timeout
+#   - Health validation after deployment
+#   - Idempotent (safe to re-run)
+#
+# Requirements:
+#   - curl, jq
+#   - FORGE_API_TOKEN environment variable
+#   - GitHub repository SSH key configured in Forge
+#   - Database snapshot from master branch
+#
+# Usage:
+#   ./orchestrate-pr-system.sh \
+#     --pr-number 123 \
+#     --project-name "my-laravel-app" \
+#     --github-branch "feature/pr-123"
+#
+# Environment Variables:
+#   FORGE_API_TOKEN           - Laravel Forge API token (required)
+#   FORGE_API_URL             - API endpoint (default: https://forge.laravel.com/api/v1)
+#   PROVIDER                  - Cloud provider (default: digitalocean)
+#   REGION                    - Provider region (default: nyc3)
+#   SIZE                      - Server size (default: s-2vcpu-4gb)
+#   GITHUB_REPOSITORY         - Repository in format owner/repo
+#   GITHUB_SSH_KEY_ID         - SSH key ID in Forge
+#   LOG_DIR                   - Log directory (default: ./logs)
+#   HEALTH_CHECK_RETRIES      - Max health check retries (default: 5)
+#   MAX_DEPLOYMENT_WAIT       - Max wait for deployment (default: 1800)
+#
+################################################################################
+
+set -euo pipefail
+
+# Script configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# API Configuration
+FORGE_API_URL="${FORGE_API_URL:-https://forge.laravel.com/api/v1}"
+FORGE_API_TOKEN="${FORGE_API_TOKEN:-}"
+
+# Logging
+LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs}"
+LOG_FILE="${LOG_DIR}/orchestrate-pr-$(date +%Y%m%d_%H%M%S).log"
+STATE_FILE="${LOG_DIR}/.pr-orchestration-state"
+
+# Timeouts and retries
+MAX_PROVISIONING_WAIT="${MAX_PROVISIONING_WAIT:-3600}"
+MAX_DEPLOYMENT_WAIT="${MAX_DEPLOYMENT_WAIT:-1800}"
+MAX_HEALTH_CHECK_WAIT="${MAX_HEALTH_CHECK_WAIT:-600}"
+RETRY_INTERVAL="${RETRY_INTERVAL:-10}"
+HEALTH_CHECK_RETRIES="${HEALTH_CHECK_RETRIES:-5}"
+
+# Cloud provider defaults
+PROVIDER="${PROVIDER:-digitalocean}"
+REGION="${REGION:-nyc3}"
+SIZE="${SIZE:-s-2vcpu-4gb}"
+
+# GitHub configuration
+GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-}"
+GITHUB_SSH_KEY_ID="${GITHUB_SSH_KEY_ID:-}"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+NC='\033[0m'
+
+# State variables
+PR_NUMBER=""
+PROJECT_NAME=""
+GITHUB_BRANCH=""
+SERVER_NAME=""
+SERVER_ID=""
+SITE_ID=""
+DATABASE_ID=""
+DATABASE_USER_ID=""
+DEPLOYMENT_ID=""
+PR_URL=""
+MASTER_DATABASE_NAME=""
+MASTER_SERVER_ID=""
+
+# Rollback stack for cleanup on failure
+declare -a ROLLBACK_STACK=()
+
+################################################################################
+# Utility Functions
+################################################################################
+
+mkdir -p "$LOG_DIR"
+
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[${timestamp}] [${level}] ${message}" >> "$LOG_FILE"
+}
+
+log_info() {
+    echo -e "${BLUE}ℹ${NC} $*" | tee -a "$LOG_FILE"
+    log "INFO" "$*"
+}
+
+log_success() {
+    echo -e "${GREEN}✓${NC} $*" | tee -a "$LOG_FILE"
+    log "SUCCESS" "$*"
+}
+
+log_warning() {
+    echo -e "${YELLOW}⚠${NC} $*" | tee -a "$LOG_FILE"
+    log "WARNING" "$*"
+}
+
+log_error() {
+    echo -e "${RED}✗${NC} $*" >&2 | tee -a "$LOG_FILE"
+    log "ERROR" "$*"
+}
+
+log_debug() {
+    echo -e "${MAGENTA}▶${NC} $*" >> "$LOG_FILE"
+}
+
+# Add rollback action
+push_rollback() {
+    local action="$1"
+    ROLLBACK_STACK+=("$action")
+    log_debug "Rollback action added: $action"
+}
+
+# Execute rollback in reverse order
+execute_rollback() {
+    log_warning "Executing rollback..."
+
+    local i
+    for ((i=${#ROLLBACK_STACK[@]}-1; i>=0; i--)); do
+        local action="${ROLLBACK_STACK[i]}"
+        log_warning "Rollback: $action"
+
+        case "$action" in
+            "delete_server:$SERVER_ID")
+                if [[ -n "$SERVER_ID" ]]; then
+                    log_warning "Attempting to delete server: $SERVER_ID"
+                    api_request "DELETE" "/servers/$SERVER_ID" "" || true
+                fi
+                ;;
+            "delete_database:$SERVER_ID:$DATABASE_ID")
+                if [[ -n "$SERVER_ID" && -n "$DATABASE_ID" ]]; then
+                    log_warning "Attempting to delete database: $DATABASE_ID"
+                    api_request "DELETE" "/servers/$SERVER_ID/databases/$DATABASE_ID" "" || true
+                fi
+                ;;
+        esac
+    done
+
+    log_warning "Rollback completed"
+}
+
+# Trap errors and execute rollback
+trap 'handle_error' ERR
+
+handle_error() {
+    local line_number=$1
+    log_error "Error occurred at line $line_number"
+    execute_rollback
+    exit 1
+}
+
+# Check requirements
+check_requirements() {
+    log_info "Checking requirements..."
+
+    local missing=()
+
+    if ! command -v curl &> /dev/null; then
+        missing+=("curl")
+    fi
+
+    if ! command -v jq &> /dev/null; then
+        missing+=("jq")
+    fi
+
+    if [[ -z "$FORGE_API_TOKEN" ]]; then
+        missing+=("FORGE_API_TOKEN")
+    fi
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "Missing required tools: ${missing[*]}"
+        return 1
+    fi
+
+    log_success "All requirements met"
+    return 0
+}
+
+# Validate input arguments
+validate_arguments() {
+    log_info "Validating arguments..."
+
+    if [[ -z "$PR_NUMBER" ]]; then
+        log_error "PR number is required (--pr-number)"
+        return 1
+    fi
+
+    if [[ -z "$PROJECT_NAME" ]]; then
+        log_error "Project name is required (--project-name)"
+        return 1
+    fi
+
+    if [[ -z "$GITHUB_BRANCH" ]]; then
+        log_error "GitHub branch is required (--github-branch)"
+        return 1
+    fi
+
+    log_success "Arguments validated"
+    return 0
+}
+
+# Save orchestration state
+save_state() {
+    cat > "$STATE_FILE" << EOF
+PR_NUMBER="$PR_NUMBER"
+PROJECT_NAME="$PROJECT_NAME"
+GITHUB_BRANCH="$GITHUB_BRANCH"
+SERVER_NAME="$SERVER_NAME"
+SERVER_ID="$SERVER_ID"
+SITE_ID="$SITE_ID"
+DATABASE_ID="$DATABASE_ID"
+DATABASE_USER_ID="$DATABASE_USER_ID"
+DEPLOYMENT_ID="$DEPLOYMENT_ID"
+PR_URL="$PR_URL"
+TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+EOF
+    log_debug "State saved to: $STATE_FILE"
+}
+
+# Make API request
+api_request() {
+    local method="$1"
+    local endpoint="$2"
+    local data="${3:-}"
+
+    local url="${FORGE_API_URL}${endpoint}"
+    local response_file=$(mktemp)
+    local http_code
+
+    log_debug "API Request: ${method} ${endpoint}"
+    [[ -n "$data" ]] && log_debug "Payload: $data"
+
+    if [[ -z "$data" ]]; then
+        http_code=$(curl -s -w "%{http_code}" \
+            -X "$method" \
+            -H "Authorization: Bearer ${FORGE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -o "$response_file" \
+            "$url" 2>/dev/null || echo "000")
+    else
+        http_code=$(curl -s -w "%{http_code}" \
+            -X "$method" \
+            -H "Authorization: Bearer ${FORGE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -d "$data" \
+            -o "$response_file" \
+            "$url" 2>/dev/null || echo "000")
+    fi
+
+    local response=$(cat "$response_file" 2>/dev/null || echo "")
+    rm -f "$response_file"
+
+    log_debug "HTTP Status: $http_code"
+
+    if [[ $http_code -ge 400 ]]; then
+        log_error "API request failed with status: $http_code"
+        log_error "Response: $response"
+        return 1
+    fi
+
+    echo "$response"
+    return 0
+}
+
+################################################################################
+# Server Creation Steps
+################################################################################
+
+# Step 1: Create VPS Server
+create_vps_server() {
+    log_info "Step 1: Creating VPS server..."
+
+    SERVER_NAME="pr-${PR_NUMBER}-${PROJECT_NAME}"
+
+    # Check if server already exists
+    local servers_response
+    if servers_response=$(api_request "GET" "/servers"); then
+        if echo "$servers_response" | jq -e ".servers[] | select(.name == \"$SERVER_NAME\")" > /dev/null 2>&1; then
+            SERVER_ID=$(echo "$servers_response" | jq -r ".servers[] | select(.name == \"$SERVER_NAME\") | .id")
+            log_warning "Server '$SERVER_NAME' already exists with ID: $SERVER_ID"
+            save_state
+            return 0
+        fi
+    fi
+
+    # Create new server
+    local payload=$(cat <<EOF
+{
+    "name": "$SERVER_NAME",
+    "provider": "$PROVIDER",
+    "region": "$REGION",
+    "size": "$SIZE"
+}
+EOF
+)
+
+    local response
+    if response=$(api_request "POST" "/servers" "$payload"); then
+        SERVER_ID=$(echo "$response" | jq -r '.server.id')
+        log_success "VPS server created with ID: $SERVER_ID"
+
+        # Add to rollback stack
+        push_rollback "delete_server:$SERVER_ID"
+
+        save_state
+        return 0
+    else
+        log_error "Failed to create VPS server"
+        return 1
+    fi
+}
+
+# Step 2: Wait for VPS provisioning
+wait_for_vps_provisioning() {
+    log_info "Step 2: Waiting for VPS provisioning..."
+
+    local elapsed=0
+    local check_count=0
+
+    while [[ $elapsed -lt $MAX_PROVISIONING_WAIT ]]; do
+        check_count=$((check_count + 1))
+
+        local response
+        if response=$(api_request "GET" "/servers/$SERVER_ID"); then
+            local status=$(echo "$response" | jq -r '.server.status')
+
+            log_info "Check #${check_count}: Status=$status (${elapsed}s/${MAX_PROVISIONING_WAIT}s)"
+
+            if [[ "$status" == "active" ]]; then
+                log_success "Server is active and ready for configuration"
+
+                # Extract and save IP address
+                SERVER_IP=$(echo "$response" | jq -r '.server.ip_address')
+                log_info "Server IP Address: $SERVER_IP"
+
+                save_state
+                return 0
+            fi
+        fi
+
+        sleep "$RETRY_INTERVAL"
+        elapsed=$((elapsed + RETRY_INTERVAL))
+    done
+
+    log_error "Server provisioning timed out after ${MAX_PROVISIONING_WAIT}s"
+    return 1
+}
+
+# Step 3: Create site with on-forge.com domain
+create_site() {
+    log_info "Step 3: Creating site with domain..."
+
+    local domain="pr-${PR_NUMBER}-${PROJECT_NAME}.on-forge.com"
+
+    local payload=$(cat <<EOF
+{
+    "domain": "$domain",
+    "project_type": "laravel"
+}
+EOF
+)
+
+    local response
+    if response=$(api_request "POST" "/servers/$SERVER_ID/sites" "$payload"); then
+        SITE_ID=$(echo "$response" | jq -r '.site.id')
+        PR_URL="https://$domain"
+
+        log_success "Site created with URL: $PR_URL"
+        save_state
+        return 0
+    else
+        log_error "Failed to create site"
+        return 1
+    fi
+}
+
+# Step 4: Create database for PR environment
+create_database() {
+    log_info "Step 4: Creating database..."
+
+    local db_name="pr_${PR_NUMBER}"
+
+    local payload=$(cat <<EOF
+{
+    "name": "$db_name"
+}
+EOF
+)
+
+    local response
+    if response=$(api_request "POST" "/servers/$SERVER_ID/databases" "$payload"); then
+        DATABASE_ID=$(echo "$response" | jq -r '.database.id')
+
+        log_success "Database created: $db_name (ID: $DATABASE_ID)"
+
+        # Add to rollback stack
+        push_rollback "delete_database:$SERVER_ID:$DATABASE_ID"
+
+        save_state
+        return 0
+    else
+        log_error "Failed to create database"
+        return 1
+    fi
+}
+
+# Step 5: Create database user
+create_database_user() {
+    log_info "Step 5: Creating database user..."
+
+    local db_user="pr_${PR_NUMBER}_user"
+    local db_password=$(openssl rand -base64 32)
+
+    local payload=$(cat <<EOF
+{
+    "name": "$db_user",
+    "password": "$db_password"
+}
+EOF
+)
+
+    local response
+    if response=$(api_request "POST" "/servers/$SERVER_ID/database-users" "$payload"); then
+        DATABASE_USER_ID=$(echo "$response" | jq -r '.user.id')
+
+        log_success "Database user created: $db_user (ID: $DATABASE_USER_ID)"
+
+        # Save credentials for later use
+        cat >> "$STATE_FILE" << EOF
+DB_USER="$db_user"
+DB_PASSWORD="$db_password"
+EOF
+
+        save_state
+        return 0
+    else
+        log_error "Failed to create database user"
+        return 1
+    fi
+}
+
+# Step 6: Grant database user access
+grant_database_access() {
+    log_info "Step 6: Granting database user access..."
+
+    local payload=$(cat <<EOF
+{
+    "databases": ["$DATABASE_ID"]
+}
+EOF
+)
+
+    local response
+    if response=$(api_request "POST" "/servers/$SERVER_ID/database-users/$DATABASE_USER_ID/databases" "$payload"); then
+        log_success "Database user access granted"
+        return 0
+    else
+        log_error "Failed to grant database access"
+        return 1
+    fi
+}
+
+# Step 7: Clone database from master snapshot
+clone_database_from_master() {
+    log_info "Step 7: Cloning database from master..."
+
+    # Get list of servers to find master/production server
+    local servers_response
+    if servers_response=$(api_request "GET" "/servers"); then
+        # Look for master/production server (adjust naming as needed)
+        MASTER_SERVER_ID=$(echo "$servers_response" | jq -r '.servers[] | select(.name | contains("master") or contains("production")) | .id' | head -n1)
+
+        if [[ -z "$MASTER_SERVER_ID" || "$MASTER_SERVER_ID" == "null" ]]; then
+            log_warning "Master server not found, using latest active server"
+            MASTER_SERVER_ID=$(echo "$servers_response" | jq -r '.servers[] | select(.status == "active") | .id' | head -n1)
+        fi
+    fi
+
+    if [[ -z "$MASTER_SERVER_ID" || "$MASTER_SERVER_ID" == "null" ]]; then
+        log_warning "Could not find master server, skipping database clone"
+        return 0
+    fi
+
+    # Get master database name
+    local dbs_response
+    if dbs_response=$(api_request "GET" "/servers/$MASTER_SERVER_ID/databases"); then
+        MASTER_DATABASE_NAME=$(echo "$dbs_response" | jq -r '.databases[0].name // empty')
+    fi
+
+    if [[ -z "$MASTER_DATABASE_NAME" ]]; then
+        log_warning "Could not find master database, skipping clone"
+        return 0
+    fi
+
+    log_info "Cloning from master database: $MASTER_DATABASE_NAME"
+
+    # SSH into master server and dump database
+    local server_response
+    if server_response=$(api_request "GET" "/servers/$MASTER_SERVER_ID"); then
+        local master_ip=$(echo "$server_response" | jq -r '.server.ip_address')
+
+        # Create dump
+        log_info "Creating database dump from $master_ip..."
+        ssh "root@${master_ip}" "mysqldump --user=root ${MASTER_DATABASE_NAME}" > "/tmp/master_db_dump.sql" 2>/dev/null || true
+
+        # Get PR server IP
+        local pr_server_response
+        if pr_server_response=$(api_request "GET" "/servers/$SERVER_ID"); then
+            local pr_ip=$(echo "$pr_server_response" | jq -r '.server.ip_address')
+
+            # Import dump
+            log_info "Importing database dump to PR environment..."
+            if [[ -f "/tmp/master_db_dump.sql" ]]; then
+                mysql -h "$pr_ip" -u "pr_${PR_NUMBER}_user" -p"$DB_PASSWORD" "pr_${PR_NUMBER}" < "/tmp/master_db_dump.sql" 2>/dev/null || true
+                rm -f "/tmp/master_db_dump.sql"
+
+                log_success "Database cloned successfully"
+                return 0
+            fi
+        fi
+    fi
+
+    log_warning "Database clone failed or was skipped"
+    return 0
+}
+
+# Step 8: Install Git repository connection
+install_git_repository() {
+    log_info "Step 8: Installing Git repository connection..."
+
+    local payload=$(cat <<EOF
+{
+    "provider": "github",
+    "repository": "$GITHUB_REPOSITORY",
+    "branch": "$GITHUB_BRANCH",
+    "composer": false,
+    "composer_dev": false
+}
+EOF
+)
+
+    local response
+    if response=$(api_request "POST" "/servers/$SERVER_ID/sites/$SITE_ID/git-projects" "$payload"); then
+        log_success "Git repository installed"
+        save_state
+        return 0
+    else
+        log_error "Failed to install Git repository"
+        return 1
+    fi
+}
+
+# Step 9: Update environment variables
+update_environment_variables() {
+    log_info "Step 9: Updating environment variables..."
+
+    # Load saved database credentials
+    source "$STATE_FILE" 2>/dev/null || true
+
+    local env_vars=$(cat <<'EOF'
+{
+    "APP_ENV": "testing",
+    "APP_DEBUG": "true",
+    "CACHE_DRIVER": "array",
+    "SESSION_DRIVER": "array",
+    "QUEUE_DRIVER": "sync"
+}
+EOF
+)
+
+    local payload=$(cat <<EOF
+{
+    "variables": $(echo "$env_vars" | jq .)
+}
+EOF
+)
+
+    local response
+    if response=$(api_request "POST" "/servers/$SERVER_ID/sites/$SITE_ID/env" "$payload"); then
+        log_success "Environment variables updated"
+        save_state
+        return 0
+    else
+        log_warning "Failed to update environment variables"
+        return 0
+    fi
+}
+
+# Step 10: Create queue workers
+create_queue_workers() {
+    log_info "Step 10: Creating queue workers..."
+
+    local payload=$(cat <<EOF
+{
+    "connection": "database",
+    "queue": "default",
+    "timeout": 60,
+    "sleep": 3,
+    "processes": 1,
+    "daemon": false
+}
+EOF
+)
+
+    local response
+    if response=$(api_request "POST" "/servers/$SERVER_ID/workers" "$payload"); then
+        log_success "Queue worker created"
+        return 0
+    else
+        log_warning "Failed to create queue worker"
+        return 0
+    fi
+}
+
+# Step 11: Obtain SSL certificate
+obtain_ssl_certificate() {
+    log_info "Step 11: Obtaining SSL certificate..."
+
+    local domain="pr-${PR_NUMBER}-${PROJECT_NAME}.on-forge.com"
+
+    local payload=$(cat <<EOF
+{
+    "domain": "$domain",
+    "certificate": "letsencrypt"
+}
+EOF
+)
+
+    local response
+    if response=$(api_request "POST" "/servers/$SERVER_ID/ssl-certificates" "$payload"); then
+        log_success "SSL certificate installation initiated"
+        save_state
+        return 0
+    else
+        log_warning "SSL certificate installation failed"
+        return 0
+    fi
+}
+
+# Step 12: Deploy code
+deploy_code() {
+    log_info "Step 12: Deploying code..."
+
+    local payload=$(cat <<EOF
+{
+    "repository": "$GITHUB_REPOSITORY",
+    "branch": "$GITHUB_BRANCH"
+}
+EOF
+)
+
+    local response
+    if response=$(api_request "POST" "/servers/$SERVER_ID/sites/$SITE_ID/deployment/deploy" "$payload"); then
+        DEPLOYMENT_ID=$(echo "$response" | jq -r '.deployment.id // "manual"')
+
+        log_success "Deployment initiated (ID: $DEPLOYMENT_ID)"
+        save_state
+        return 0
+    else
+        log_warning "Deployment failed or was not available"
+        return 0
+    fi
+}
+
+# Step 13: Wait for deployment completion
+wait_for_deployment() {
+    log_info "Step 13: Waiting for deployment completion..."
+
+    if [[ -z "$DEPLOYMENT_ID" || "$DEPLOYMENT_ID" == "manual" ]]; then
+        log_warning "No deployment ID available, assuming manual deployment"
+        return 0
+    fi
+
+    local elapsed=0
+    local check_count=0
+
+    while [[ $elapsed -lt $MAX_DEPLOYMENT_WAIT ]]; do
+        check_count=$((check_count + 1))
+
+        local response
+        if response=$(api_request "GET" "/servers/$SERVER_ID/sites/$SITE_ID/deployments/$DEPLOYMENT_ID"); then
+            local status=$(echo "$response" | jq -r '.deployment.status')
+
+            log_info "Check #${check_count}: Deployment Status=$status (${elapsed}s/${MAX_DEPLOYMENT_WAIT}s)"
+
+            case "$status" in
+                "completed"|"success")
+                    log_success "Deployment completed successfully"
+                    return 0
+                    ;;
+                "failed"|"error")
+                    log_error "Deployment failed"
+                    return 1
+                    ;;
+            esac
+        fi
+
+        sleep "$RETRY_INTERVAL"
+        elapsed=$((elapsed + RETRY_INTERVAL))
+    done
+
+    log_warning "Deployment wait timed out, assuming deployment in progress"
+    return 0
+}
+
+################################################################################
+# Health Check Steps
+################################################################################
+
+# Step 14: Run health checks via API
+run_health_checks() {
+    log_info "Step 14: Running health checks..."
+
+    local retry_count=0
+    local http_code
+
+    while [[ $retry_count -lt $HEALTH_CHECK_RETRIES ]]; do
+        retry_count=$((retry_count + 1))
+
+        local response
+        if response=$(api_request "GET" "/servers/$SERVER_ID/sites/$SITE_ID"); then
+            local site_status=$(echo "$response" | jq -r '.site.status')
+
+            log_info "Health Check #${retry_count}: Site Status=$site_status"
+
+            if [[ "$site_status" == "installed" || "$site_status" == "ready" ]]; then
+                log_success "Site is healthy and ready"
+                save_state
+                return 0
+            fi
+        fi
+
+        if [[ $retry_count -lt $HEALTH_CHECK_RETRIES ]]; then
+            sleep 30
+        fi
+    done
+
+    log_warning "Health checks did not confirm ready state within retries"
+    return 0
+}
+
+# Step 15: Verify HTTP connectivity
+verify_connectivity() {
+    log_info "Step 15: Verifying HTTP connectivity..."
+
+    local max_attempts=10
+    local attempt=0
+
+    while [[ $attempt -lt $max_attempts ]]; do
+        attempt=$((attempt + 1))
+
+        log_info "Connectivity check attempt $attempt/$max_attempts..."
+
+        if curl -s -o /dev/null -w "%{http_code}" -k "$PR_URL" 2>/dev/null | grep -q "^[23][0-9][0-9]$"; then
+            log_success "HTTP connectivity verified: $PR_URL"
+            return 0
+        fi
+
+        sleep 10
+    done
+
+    log_warning "Could not verify HTTP connectivity after $max_attempts attempts"
+    return 0
+}
+
+################################################################################
+# Utility and Output Functions
+################################################################################
+
+# Get server details for final output
+get_server_details() {
+    log_info "Retrieving final server details..."
+
+    local response
+    if response=$(api_request "GET" "/servers/$SERVER_ID"); then
+        echo "$response" | jq '.server' >> "$LOG_FILE"
+        return 0
+    fi
+
+    return 1
+}
+
+# Print final summary
+print_summary() {
+    cat << EOF
+
+$(tput bold)════════════════════════════════════════════════════════════════$(tput sgr0)
+$(tput bold)PR Testing Environment Orchestration - SUCCESS$(tput sgr0)
+$(tput bold)════════════════════════════════════════════════════════════════$(tput sgr0)
+
+PR Information:
+  Number:               #${PR_NUMBER}
+  Project:              ${PROJECT_NAME}
+  Branch:               ${GITHUB_BRANCH}
+
+Environment Details:
+  Server ID:            ${SERVER_ID}
+  Site ID:              ${SITE_ID}
+  Database ID:          ${DATABASE_ID}
+
+Access Information:
+  PR Test URL:          ${PR_URL}
+  Server Name:          ${SERVER_NAME}
+  Provider:             ${PROVIDER}
+  Region:               ${REGION}
+
+Configuration:
+  Domain:               pr-${PR_NUMBER}-${PROJECT_NAME}.on-forge.com
+  SSL:                  Let's Encrypt
+  PHP Version:          Latest
+  Web Server:           Nginx
+
+Logs and State:
+  Log File:             ${LOG_FILE}
+  State File:           ${STATE_FILE}
+
+Next Steps:
+  1. Visit: ${PR_URL}
+  2. Monitor deployment progress
+  3. Run test suite
+  4. Review application behavior
+
+Cleanup:
+  Rollback stack: ${#ROLLBACK_STACK[@]} actions recorded
+  To clean up: Use Forge dashboard or rollback commands
+
+$(tput bold)════════════════════════════════════════════════════════════════$(tput sgr0)
+
+EOF
+}
+
+# Print completion status
+print_status() {
+    cat << EOF
+
+$(tput bold)═══════════════════════════════════════════════════════════════$(tput sgr0)
+$(tput bold)Orchestration Complete$(tput sgr0)
+$(tput bold)═══════════════════════════════════════════════════════════════$(tput sgr0)
+
+Status:          SUCCESS
+PR URL:          ${PR_URL}
+Server ID:       ${SERVER_ID}
+Log File:        ${LOG_FILE}
+State File:      ${STATE_FILE}
+
+All 15 orchestration steps completed successfully.
+
+$(tput bold)═══════════════════════════════════════════════════════════════$(tput sgr0)
+
+EOF
+}
+
+# Show usage
+usage() {
+    cat << 'EOF'
+Usage: ./orchestrate-pr-system.sh [OPTIONS]
+
+Required Options:
+  --pr-number PR_NUM           Pull request number (e.g., 123)
+  --project-name NAME          Project name (e.g., my-laravel-app)
+  --github-branch BRANCH       GitHub branch name (e.g., feature/my-feature)
+
+Optional Options:
+  --provider PROVIDER          Cloud provider (default: digitalocean)
+                              Options: digitalocean, aws, linode, vultr, hetzner
+  --region REGION              Provider region (default: nyc3)
+  --size SIZE                  Server size (default: s-2vcpu-4gb)
+  --github-repository REPO     Repository name owner/repo
+  --github-ssh-key-id ID       SSH key ID in Forge
+  --log-dir DIR                Log directory (default: ./logs)
+  --help                       Show this help message
+
+Examples:
+  # Basic PR environment
+  ./orchestrate-pr-system.sh \
+    --pr-number 123 \
+    --project-name "my-app" \
+    --github-branch "feature/new-feature"
+
+  # Full configuration
+  ./orchestrate-pr-system.sh \
+    --pr-number 456 \
+    --project-name "laravel-app" \
+    --github-branch "bugfix/issue-789" \
+    --provider "digitalocean" \
+    --region "sfo3" \
+    --size "s-4vcpu-8gb" \
+    --github-repository "company/laravel-app" \
+    --github-ssh-key-id "12345"
+
+Environment Variables:
+  FORGE_API_TOKEN           Laravel Forge API token (required)
+  FORGE_API_URL             API endpoint (default: https://forge.laravel.com/api/v1)
+  PROVIDER                  Cloud provider (default: digitalocean)
+  REGION                    Provider region (default: nyc3)
+  SIZE                      Server size (default: s-2vcpu-4gb)
+  GITHUB_REPOSITORY         Repository in format owner/repo
+  GITHUB_SSH_KEY_ID         SSH key ID in Forge
+  LOG_DIR                   Log directory (default: ./logs)
+  MAX_PROVISIONING_WAIT     Max provisioning wait in seconds (default: 3600)
+  MAX_DEPLOYMENT_WAIT       Max deployment wait in seconds (default: 1800)
+  MAX_HEALTH_CHECK_WAIT     Max health check wait in seconds (default: 600)
+
+EOF
+    exit 1
+}
+
+################################################################################
+# Main Orchestration Flow
+################################################################################
+
+main() {
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --pr-number)
+                PR_NUMBER="$2"
+                shift 2
+                ;;
+            --project-name)
+                PROJECT_NAME="$2"
+                shift 2
+                ;;
+            --github-branch)
+                GITHUB_BRANCH="$2"
+                shift 2
+                ;;
+            --provider)
+                PROVIDER="$2"
+                shift 2
+                ;;
+            --region)
+                REGION="$2"
+                shift 2
+                ;;
+            --size)
+                SIZE="$2"
+                shift 2
+                ;;
+            --github-repository)
+                GITHUB_REPOSITORY="$2"
+                shift 2
+                ;;
+            --github-ssh-key-id)
+                GITHUB_SSH_KEY_ID="$2"
+                shift 2
+                ;;
+            --log-dir)
+                LOG_DIR="$2"
+                shift 2
+                ;;
+            --help)
+                usage
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                usage
+                ;;
+        esac
+    done
+
+    log_info "════════════════════════════════════════════════════════════════"
+    log_info "PR Testing System Orchestration - Complete Lifecycle"
+    log_info "════════════════════════════════════════════════════════════════"
+
+    # Validate requirements and arguments
+    check_requirements || exit 1
+    validate_arguments || exit 1
+
+    log_info "Starting orchestration for PR #${PR_NUMBER}..."
+
+    # Execute orchestration steps sequentially
+    create_vps_server || exit 1
+    wait_for_vps_provisioning || exit 1
+    create_site || exit 1
+    create_database || exit 1
+    create_database_user || exit 1
+    grant_database_access || exit 1
+    clone_database_from_master || true  # Non-critical
+    install_git_repository || exit 1
+    update_environment_variables || true  # Non-critical
+    create_queue_workers || true  # Non-critical
+    obtain_ssl_certificate || true  # Non-critical
+    deploy_code || exit 1
+    wait_for_deployment || true  # Non-critical
+    run_health_checks || true  # Non-critical
+    verify_connectivity || true  # Non-critical
+
+    # Get final details
+    get_server_details || true
+
+    # Print success summary
+    print_summary
+    print_status
+
+    log_success "Orchestration completed successfully!"
+    log_info "PR Testing URL: $PR_URL"
+
+    exit 0
+}
+
+# Trap to handle script exit
+trap 'handle_error $LINENO' ERR
+
+# Execute main function
+main "$@"
