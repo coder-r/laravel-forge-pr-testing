@@ -278,7 +278,7 @@ jobs:
           echo "Deploying PR branch: ${PR_BRANCH}"
 
           # Update deployment script to use PR branch
-          curl -s -X PUT "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}/deployment-script" \
+          curl -s -X PUT "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}/deployment/script" \
             -H "Authorization: Bearer ${FORGE_TOKEN}" \
             -H "Content-Type: application/json" \
             -d @- <<'EOF'
@@ -288,9 +288,8 @@ jobs:
           EOF
 
           # Trigger deployment
-          curl -s -X POST "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}/deployment/request" \
-            -H "Authorization: Bearer ${FORGE_TOKEN}" \
-            -H "Content-Type: application/json" | jq .
+          curl -s -X POST "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}/deployment/deploy" \
+            -H "Authorization: Bearer ${FORGE_TOKEN}" | jq .
 
       - name: Setup Environment Variables
         env:
@@ -303,24 +302,13 @@ jobs:
 
           echo "Configuring environment variables..."
 
-          # Set database credentials
-          curl -s -X POST "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}/environment-variables" \
+          # Set environment variables (use PUT /env with full .env content)
+          curl -s -X PUT "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}/env" \
             -H "Authorization: Bearer ${FORGE_TOKEN}" \
             -H "Content-Type: application/json" \
             -d @- <<EOF
           {
-            "name": "APP_ENV",
-            "value": "testing"
-          }
-          EOF
-
-          curl -s -X POST "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}/environment-variables" \
-            -H "Authorization: Bearer ${FORGE_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d @- <<EOF
-          {
-            "name": "APP_DEBUG",
-            "value": "false"
+            "content": "APP_ENV=testing\nAPP_DEBUG=true\nDB_DATABASE=pr_${PR_NUMBER}_db\nDB_USERNAME=forge\nDB_PASSWORD=\${DB_PASSWORD}\nREDIS_DATABASE=${PR_NUMBER}"
           }
           EOF
 
@@ -364,7 +352,7 @@ jobs:
           echo "Enabling SSL certificate..."
 
           # Enable Let's Encrypt SSL (automatic for on-forge.com)
-          curl -s -X POST "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}/certificates" \
+          curl -s -X POST "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}/certificates/letsencrypt" \
             -H "Authorization: Bearer ${FORGE_TOKEN}" \
             -H "Content-Type: application/json" \
             -d '{
@@ -511,9 +499,8 @@ jobs:
           echo "Deploying latest code from branch: ${PR_BRANCH}"
 
           # Trigger deployment
-          curl -s -X POST "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}/deployment/request" \
-            -H "Authorization: Bearer ${FORGE_TOKEN}" \
-            -H "Content-Type: application/json" | jq .
+          curl -s -X POST "${FORGE_API_BASE_URL}/servers/${SERVER_ID}/sites/${SITE_ID}/deployment/deploy" \
+            -H "Authorization: Bearer ${FORGE_TOKEN}" | jq .
 
           echo "Deployment triggered"
 
