@@ -1,0 +1,66 @@
+echo "=========================================="
+echo "Starting deployment..."
+echo "=========================================="
+echo ""
+
+cd /home/prdevpel/pr-test-devpel.on-forge.com
+echo "✓ Changed to site directory"
+
+git pull origin main
+echo "✓ Git pull completed"
+echo ""
+
+# Composer
+echo "Installing Composer dependencies (with 2GB memory)..."
+php -d memory_limit=2048M /usr/local/bin/composer install --no-interaction --prefer-dist --optimize-autoloader --no-dev
+echo "✓ Composer install completed"
+echo ""
+
+# NPM
+echo "Installing NPM dependencies..."
+npm ci
+echo "✓ NPM dependencies installed"
+echo ""
+
+echo "Building assets..."
+npm run build
+echo "✓ Asset build completed"
+echo ""
+
+# Clear caches
+echo "Clearing application caches..."
+php -d memory_limit=2048M artisan cache:clear
+echo "✓ Cache cleared"
+
+php -d memory_limit=2048M artisan config:clear
+echo "✓ Config cache cleared"
+
+php -d memory_limit=2048M artisan view:clear
+echo "✓ View cache cleared"
+echo ""
+
+# Cache config ONLY (skip routes - causes memory issue)
+echo "Caching configuration (with 2GB memory)..."
+php -d memory_limit=2048M artisan config:cache
+echo "✓ Config cached successfully"
+echo ""
+
+# Migrations
+echo "Running database migrations..."
+php -d memory_limit=2048M artisan migrate --force
+echo "✓ Migrations completed"
+echo ""
+
+# Reload PHP
+echo "Reloading PHP-FPM..."
+( flock -w 10 9 || exit 1
+    echo 'Restarting FPM...'; sudo -S service php8.3-fpm reload ) 9>/tmp/fpmlock
+echo "✓ PHP-FPM reloaded"
+echo ""
+
+echo "=========================================="
+echo "✅ Deployment completed successfully!"
+echo "=========================================="
+echo ""
+echo "Memory used: $(php -r 'echo round(memory_get_peak_usage()/1024/1024, 2);')MB"
+echo "Time: $(date)"

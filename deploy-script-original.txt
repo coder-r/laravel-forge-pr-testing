@@ -1,0 +1,10 @@
+cd /home/prdevpel/pr-test-devpel.on-forge.com
+git pull origin main
+$FORGE_COMPOSER install --no-interaction --prefer-dist --optimize-autoloader --no-dev
+npm ci
+npm run build
+$FORGE_PHP artisan migrate --force
+$FORGE_PHP artisan optimize
+
+( flock -w 10 9 || exit 1
+    echo 'Restarting FPM...'; sudo -S service $FORGE_PHP_FPM reload ) 9>/tmp/fpmlock
